@@ -139,6 +139,15 @@ destination.
 Clients must trust that CA. Do not distribute the example CA outside local
 testing; generate and protect a CA appropriate for your environment.
 
+Clients send no TLS SNI for IP-address URLs such as `https://192.0.2.10/`, and
+some omit it for hostnames. Inside a CONNECT tunnel, the proxy then generates the
+certificate for the CONNECT target instead, as an IP or DNS subject alternative
+name. These connections never resume a TLS session, so each one performs a full
+handshake. When a client does send SNI, the certificate follows the SNI. Either
+way, the request is routed by its own HTTP authority, which is not required to
+match the certificate. A connection without SNI that did not arrive through
+CONNECT gets no certificate.
+
 Start the proxy:
 
 ```bash

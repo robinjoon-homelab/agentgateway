@@ -1306,6 +1306,558 @@ async fn connect_tunnel_dynamic_ca_obo_dynamic_backend() {
 	);
 }
 
+/// CONNECT to a dynamic CA listener where the client omits SNI, as clients do for
+/// IP-address URLs. The certificate names the CONNECT authority, while routing keeps
+/// following the HTTP authority exactly as it does when SNI and Host differ.
+#[cfg(feature = "crypto-aws-lc")]
+mod dynamic_ca_no_sni {
+	use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose};
+	use rustls::HandshakeKind;
+	use rustls_pki_types::CertificateDer;
+	use rustls_pki_types::pem::PemObject;
+	use tokio::io::DuplexStream;
+	use tokio_rustls::client::TlsStream;
+	use wiremock::tls_certs::MockServerTlsConfig;
+
+	use super::*;
+
+	const IPV4: &str = "192.0.2.10";
+	const IPV6: &str = "2001:db8::10";
+	const DNS: &str = "api.example.test";
+	const PORT: u16 = 18082;
+
+	struct TestCa {
+		params: CertificateParams,
+		key: KeyPair,
+		cert_pem: Vec<u8>,
+	}
+
+	impl TestCa {
+		fn new() -> Self {
+			let _ = rustls::crypto::CryptoProvider::install_default(Arc::unwrap_or_clone(
+				agentgateway::transport::tls::provider(),
+			));
+			let key = KeyPair::generate().expect("generate CA key");
+			let mut params = CertificateParams::default();
+			params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+			params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+			let cert_pem = params
+				.self_signed(&key)
+				.expect("generate CA cert")
+				.pem()
+				.into_bytes();
+			Self {
+				params,
+				key,
+				cert_pem,
+			}
+		}
+
+		fn listener_tls(&self) -> agentgateway::types::agent::ServerTLSConfig {
+			agentgateway::types::agent::ServerTLSConfig::dynamic_ca_with_profile(
+				self.cert_pem.clone(),
+				self.key.serialize_pem().into_bytes(),
+				vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+				None,
+				None,
+				None,
+				None,
+				Default::default(),
+			)
+			.expect("build dynamic CA TLS config")
+		}
+
+		fn backend_tls(&self) -> agentgateway::http::backendtls::BackendTLS {
+			agentgateway::http::backendtls::ResolvedBackendTLS {
+				root: Some(self.cert_pem.clone()),
+				..Default::default()
+			}
+			.try_into()
+			.unwrap()
+		}
+
+		/// A strictly verifying client, which keeps a session cache between connections.
+		fn client(&self, alpn: &str, enable_sni: bool) -> TlsConnector {
+			let mut roots = rustls::RootCertStore::empty();
+			roots.add_parsable_certificates(
+				CertificateDer::pem_slice_iter(&self.cert_pem).map(|c| c.expect("CA PEM")),
+			);
+			let mut config =
+				rustls::ClientConfig::builder_with_provider(agentgateway::transport::tls::provider())
+					.with_safe_default_protocol_versions()
+					.expect("client versions")
+					.with_root_certificates(roots)
+					.with_no_client_auth();
+			config.alpn_protocols = vec![alpn.as_bytes().to_vec()];
+			config.enable_sni = enable_sni;
+			TlsConnector::from(Arc::new(config))
+		}
+
+		async fn upstream(&self, san: &str) -> MockServer {
+			self
+				.upstream_on(
+					san,
+					std::net::TcpListener::bind("127.0.0.1:0").expect("bind upstream"),
+				)
+				.await
+		}
+
+		async fn upstream_on(&self, san: &str, listener: std::net::TcpListener) -> MockServer {
+			let key = KeyPair::generate().expect("generate leaf key");
+			let issuer_params = self.params.clone();
+			let issuer_key = KeyPair::from_pem(&self.key.serialize_pem()).expect("copy CA key");
+			let issuer = Issuer::new(issuer_params, issuer_key);
+			let cert = CertificateParams::new(vec![san.to_string()])
+				.expect("leaf params")
+				.signed_by(&key, &issuer)
+				.expect("sign leaf");
+			let upstream = MockServer::builder()
+				.listener(listener)
+				.start_https(MockServerTlsConfig::from_der(
+					CertificateDer::from_pem_slice(&self.cert_pem)
+						.expect("CA PEM")
+						.to_vec(),
+					vec![cert.der().to_vec()],
+					key.serialize_der(),
+				))
+				.await;
+			Mock::given(wiremock::matchers::any())
+				.respond_with(ResponseTemplate::new(200))
+				.mount(&upstream)
+				.await;
+			upstream
+		}
+	}
+
+	fn inner_bind(protocol: ListenerProtocol) -> BindSnapshot {
+		BindSnapshot::new(
+			Bind {
+				key: BIND_KEY,
+				address: format!("0.0.0.0:{PORT}").parse().unwrap(),
+				protocol: BindProtocol::tls,
+				tunnel_protocol: Default::default(),
+				mode: Default::default(),
+			},
+			ListenerSet::from_list([Listener {
+				key: LISTENER_KEY,
+				name: Default::default(),
+				hostname: Default::default(),
+				protocol,
+				..Default::default()
+			}]),
+		)
+	}
+
+	fn gateway(protocol: ListenerProtocol, backend_policies: Vec<BackendTrafficPolicy>) -> TestBind {
+		let mut outer = simple_bind();
+		outer.key = strng::literal!("outer");
+		outer.address = "127.0.0.1:15010".parse().unwrap();
+		outer.tunnel_protocol = TunnelProtocol::Connect;
+
+		let backend = Backend::Dynamic(ResourceName::new("dynamic".into(), "".into()), None);
+		let t = setup_proxy_test("{}").unwrap();
+		t.inputs().stores.binds.write().insert_backend(
+			backend.name(),
+			BackendWithPolicies {
+				backend,
+				inline_policies: backend_policies,
+			},
+		);
+		t.with_bind(outer)
+			.with_bind(inner_bind(protocol))
+			.with_route(basic_named_route("/dynamic".into()))
+	}
+
+	async fn open_tunnel(t: &TestBind, host: &str) -> DuplexStream {
+		let authority = match host.parse::<std::net::Ipv6Addr>() {
+			Ok(_) => format!("[{host}]:{PORT}"),
+			Err(_) => format!("{host}:{PORT}"),
+		};
+		let mut io = t.serve_tunnel(strng::literal!("outer"));
+		io.write_all(format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n").as_bytes())
+			.await
+			.unwrap();
+		let mut response = Vec::new();
+		while !response.windows(4).any(|w| w == b"\r\n\r\n") {
+			let mut chunk = [0; 1024];
+			let n = io.read(&mut chunk).await.unwrap();
+			assert!(n > 0, "CONNECT response unexpectedly closed");
+			response.extend_from_slice(&chunk[..n]);
+		}
+		assert!(
+			String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200 OK\r\n"),
+			"unexpected CONNECT response: {}",
+			String::from_utf8_lossy(&response),
+		);
+		io
+	}
+
+	async fn handshake(
+		client: &TlsConnector,
+		io: DuplexStream,
+		name: &str,
+	) -> std::io::Result<TlsStream<DuplexStream>> {
+		client
+			.connect(ServerName::try_from(name.to_string()).unwrap(), io)
+			.await
+	}
+
+	async fn get_http1(tls: TlsStream<DuplexStream>, host: &str) -> StatusCode {
+		let (mut sender, conn) = http1::handshake(TokioIo::new(tls)).await.unwrap();
+		let conn = tokio::spawn(conn);
+		let res = sender
+			.send_request(
+				::http::Request::builder()
+					.method(Method::GET)
+					.uri("/foo")
+					.header(header::HOST, host)
+					.header(header::CONNECTION, "close")
+					.body(Body::empty())
+					.unwrap(),
+			)
+			.await
+			.unwrap();
+		conn.abort();
+		res.status()
+	}
+
+	async fn get_http2(tls: TlsStream<DuplexStream>, host: &str) -> StatusCode {
+		let (mut sender, conn) =
+			hyper::client::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
+				.handshake(TokioIo::new(tls))
+				.await
+				.unwrap();
+		let conn = tokio::spawn(conn);
+		let res = sender
+			.send_request(
+				::http::Request::builder()
+					.method(Method::GET)
+					.uri(format!("https://{host}/foo"))
+					.body(Body::empty())
+					.unwrap(),
+			)
+			.await
+			.unwrap();
+		conn.abort();
+		res.status()
+	}
+
+	#[tokio::test]
+	async fn issues_for_ip_and_dns_authorities_over_http1_and_http2() {
+		let ca = TestCa::new();
+		let upstream = simple_mock().await;
+		let upstream_host = upstream.address().to_string();
+		let t = gateway(ListenerProtocol::HTTPS(ca.listener_tls()), vec![]);
+
+		// The client verifies the certificate against the CONNECT target, while the request
+		// is routed by its own authority: the two legitimately differ, as with SNI and Host.
+		for (host, enable_sni) in [(IPV4, true), (IPV6, true), (DNS, false)] {
+			let tls = handshake(
+				&ca.client("http/1.1", enable_sni),
+				open_tunnel(&t, host).await,
+				host,
+			)
+			.await
+			.unwrap_or_else(|e| panic!("{host} over HTTP/1.1 should verify: {e}"));
+			assert_eq!(get_http1(tls, &upstream_host).await, StatusCode::OK);
+
+			let tls = handshake(
+				&ca.client("h2", enable_sni),
+				open_tunnel(&t, host).await,
+				host,
+			)
+			.await
+			.unwrap_or_else(|e| panic!("{host} over HTTP/2 should verify: {e}"));
+			assert_eq!(tls.get_ref().1.alpn_protocol(), Some(b"h2".as_slice()));
+			assert_eq!(get_http2(tls, &upstream_host).await, StatusCode::OK);
+		}
+		assert_eq!(upstream.received_requests().await.unwrap().len(), 6);
+	}
+
+	#[tokio::test]
+	async fn sni_keeps_selecting_the_certificate() {
+		let ca = TestCa::new();
+		let t = gateway(ListenerProtocol::HTTPS(ca.listener_tls()), vec![]);
+
+		// Matching SNI and CONNECT authority.
+		handshake(
+			&ca.client("http/1.1", true),
+			open_tunnel(&t, DNS).await,
+			DNS,
+		)
+		.await
+		.expect("SNI matching CONNECT should verify");
+
+		// SNI differing from the CONNECT authority stays allowed and wins.
+		handshake(
+			&ca.client("http/1.1", true),
+			open_tunnel(&t, IPV4).await,
+			DNS,
+		)
+		.await
+		.expect("certificate should follow the SNI");
+	}
+
+	#[tokio::test]
+	async fn concurrent_destinations_get_their_own_certificates() {
+		let ca = TestCa::new();
+		let upstream = simple_mock().await;
+		let upstream_host = upstream.address().to_string();
+		let t = gateway(ListenerProtocol::HTTPS(ca.listener_tls()), vec![]);
+		let client = ca.client("http/1.1", true);
+
+		let mut connections = Vec::new();
+		for i in 1..=8 {
+			for host in [format!("192.0.2.{i}"), format!("2001:db8::{i}")] {
+				let io = open_tunnel(&t, &host).await;
+				let (client, upstream_host) = (client.clone(), upstream_host.clone());
+				connections.push(tokio::spawn(async move {
+					let tls = handshake(&client, io, &host)
+						.await
+						.unwrap_or_else(|e| panic!("{host} should verify: {e}"));
+					get_http1(tls, &upstream_host).await
+				}));
+			}
+		}
+		for connection in connections {
+			assert_eq!(connection.await.unwrap(), StatusCode::OK);
+		}
+
+		// A cached certificate still only names the destination it was issued for.
+		assert!(
+			handshake(&client, open_tunnel(&t, "192.0.2.1").await, "192.0.2.2")
+				.await
+				.is_err()
+		);
+	}
+
+	#[tokio::test]
+	async fn sessions_are_not_resumed_without_sni() {
+		let ca = TestCa::new();
+		let upstream = simple_mock().await;
+		let upstream_host = upstream.address().to_string();
+		let t = gateway(ListenerProtocol::HTTPS(ca.listener_tls()), vec![]);
+
+		let kind = async |client: &TlsConnector, connect: &str, name: &str| {
+			let tls = handshake(client, open_tunnel(&t, connect).await, name)
+				.await
+				.expect("handshake");
+			let kind = tls.get_ref().1.handshake_kind();
+			// Completing a request also delivers any TLS 1.3 tickets to the client.
+			assert_eq!(get_http1(tls, &upstream_host).await, StatusCode::OK);
+			kind
+		};
+
+		let client = ca.client("http/1.1", true);
+		for _ in 0..2 {
+			assert_eq!(
+				kind(&client, IPV4, IPV4).await,
+				Some(HandshakeKind::Full),
+				"sessions must not outlive a CONNECT authority without SNI"
+			);
+		}
+
+		let client = ca.client("http/1.1", true);
+		assert_eq!(kind(&client, DNS, DNS).await, Some(HandshakeKind::Full));
+		assert_eq!(kind(&client, DNS, DNS).await, Some(HandshakeKind::Resumed));
+	}
+
+	#[tokio::test]
+	async fn no_certificate_without_a_usable_connect_authority() {
+		let ca = TestCa::new();
+		let t = gateway(ListenerProtocol::HTTPS(ca.listener_tls()), vec![]);
+		let client = ca.client("http/1.1", true);
+
+		// No CONNECT: the gateway does not guess an identity from its own address.
+		assert!(handshake(&client, t.serve(BIND_KEY), IPV4).await.is_err());
+		handshake(&client, t.serve(BIND_KEY), DNS)
+			.await
+			.expect("the listener serves clients that send SNI");
+
+		// CONNECT to something which is neither a DNS name nor an IP address.
+		for host in ["127.1", "256.256.256.256"] {
+			assert!(
+				handshake(&client, open_tunnel(&t, host).await, IPV4)
+					.await
+					.is_err(),
+				"{host} must not get a certificate"
+			);
+		}
+	}
+
+	#[tokio::test]
+	async fn static_listener_keeps_its_certificate() {
+		let t = gateway(ListenerProtocol::HTTPS(test_server_tls_config()), vec![]);
+		let static_root: agentgateway::http::backendtls::BackendTLS =
+			agentgateway::http::backendtls::ResolvedBackendTLS {
+				root: Some(include_bytes!("../../../../examples/mcp-tls/certs/ca-cert.pem").to_vec()),
+				insecure_host: true,
+				alpn: Some(vec!["http/1.1".to_string()]),
+				..Default::default()
+			}
+			.try_into()
+			.unwrap();
+
+		// Chains to the static listener's own CA, so nothing was issued for the authority.
+		TlsConnector::from(static_root.base_config().config)
+			.connect(
+				ServerName::try_from(IPV4.to_string()).unwrap(),
+				open_tunnel(&t, IPV4).await,
+			)
+			.await
+			.expect("static listener should serve its certificate");
+	}
+
+	#[tokio::test]
+	async fn upstream_verification_is_preserved() {
+		let ca = TestCa::new();
+		let client = ca.client("http/1.1", true);
+		let t = gateway(
+			ListenerProtocol::HTTPS(ca.listener_tls()),
+			vec![BackendTrafficPolicy::BackendTLS(ca.backend_tls())],
+		);
+		// Downstream succeeds for an IP-address URL in every case; only upstream differs.
+		let through_gateway = async |upstream_host: String| {
+			let tls = handshake(&client, open_tunnel(&t, IPV4).await, IPV4)
+				.await
+				.expect("downstream handshake");
+			get_http1(tls, &upstream_host).await
+		};
+		let localhost = |upstream: &MockServer| format!("localhost:{}", upstream.address().port());
+
+		let upstream = ca.upstream("127.0.0.1").await;
+		assert_eq!(
+			through_gateway(upstream.address().to_string()).await,
+			StatusCode::OK
+		);
+		assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+
+		let upstream = ca.upstream("localhost").await;
+		assert_eq!(through_gateway(localhost(&upstream)).await, StatusCode::OK);
+		assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+
+		let wrong_ip = ca.upstream("127.0.0.2").await;
+		let wrong_dns = ca.upstream("other.example.test").await;
+		let wrong_ca = TestCa::new().upstream("127.0.0.1").await;
+		for (case, upstream, host) in [
+			("wrong IP", &wrong_ip, wrong_ip.address().to_string()),
+			("wrong DNS name", &wrong_dns, localhost(&wrong_dns)),
+			("wrong CA", &wrong_ca, wrong_ca.address().to_string()),
+		] {
+			let status = through_gateway(host).await;
+			assert!(status.is_server_error(), "{case}: unexpected {status}");
+			assert_eq!(
+				upstream.received_requests().await.unwrap().len(),
+				0,
+				"{case}: request must not reach an unverified upstream"
+			);
+		}
+	}
+
+	/// A bracketed IPv6 request authority must dial that address, not resolve it as a name.
+	#[tokio::test]
+	async fn ipv6_urls_reach_ipv6_upstreams_with_verification() {
+		fn ipv6_loopback() -> Option<std::net::TcpListener> {
+			std::net::TcpListener::bind("[::1]:0").ok()
+		}
+		const CLIENT_TARGET: &str = "::1";
+
+		let ca = TestCa::new();
+		let Some(plain_listener) = ipv6_loopback() else {
+			eprintln!("skipping: this host has no IPv6 loopback");
+			return;
+		};
+		let plain = MockServer::builder().listener(plain_listener).start().await;
+		Mock::given(wiremock::matchers::any())
+			.respond_with(ResponseTemplate::new(200))
+			.mount(&plain)
+			.await;
+		let plain_host = plain.address().to_string();
+		assert!(plain_host.starts_with("[::1]:"), "{plain_host}");
+
+		let t = gateway(ListenerProtocol::HTTPS(ca.listener_tls()), vec![]);
+		let tls = handshake(
+			&ca.client("http/1.1", true),
+			open_tunnel(&t, CLIENT_TARGET).await,
+			CLIENT_TARGET,
+		)
+		.await
+		.expect("downstream HTTP/1.1 handshake");
+		assert_eq!(get_http1(tls, &plain_host).await, StatusCode::OK);
+		let tls = handshake(
+			&ca.client("h2", true),
+			open_tunnel(&t, CLIENT_TARGET).await,
+			CLIENT_TARGET,
+		)
+		.await
+		.expect("downstream HTTP/2 handshake");
+		assert_eq!(get_http2(tls, &plain_host).await, StatusCode::OK);
+		assert_eq!(plain.received_requests().await.unwrap().len(), 2);
+
+		let t = gateway(
+			ListenerProtocol::HTTPS(ca.listener_tls()),
+			vec![BackendTrafficPolicy::BackendTLS(ca.backend_tls())],
+		);
+		let client = ca.client("http/1.1", true);
+		let through_gateway = async |upstream: &MockServer| {
+			let tls = handshake(&client, open_tunnel(&t, CLIENT_TARGET).await, CLIENT_TARGET)
+				.await
+				.expect("downstream handshake");
+			get_http1(tls, &upstream.address().to_string()).await
+		};
+
+		let upstream = ca.upstream_on("::1", ipv6_loopback().unwrap()).await;
+		assert_eq!(through_gateway(&upstream).await, StatusCode::OK);
+		assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+
+		let wrong_ip = ca.upstream_on("::2", ipv6_loopback().unwrap()).await;
+		let wrong_ca = TestCa::new()
+			.upstream_on("::1", ipv6_loopback().unwrap())
+			.await;
+		for (case, upstream) in [("wrong IP", &wrong_ip), ("wrong CA", &wrong_ca)] {
+			let status = through_gateway(upstream).await;
+			assert!(status.is_server_error(), "{case}: unexpected {status}");
+			assert_eq!(
+				upstream.received_requests().await.unwrap().len(),
+				0,
+				"{case}: request must not reach an unverified upstream"
+			);
+		}
+	}
+
+	#[tokio::test]
+	async fn ca_reload_applies_to_no_sni_connections() {
+		let old_ca = TestCa::new();
+		let new_ca = TestCa::new();
+		let t = gateway(ListenerProtocol::HTTPS(old_ca.listener_tls()), vec![]);
+		handshake(
+			&old_ca.client("http/1.1", true),
+			open_tunnel(&t, IPV4).await,
+			IPV4,
+		)
+		.await
+		.expect("initial CA should verify");
+
+		let t = t.with_bind(inner_bind(ListenerProtocol::HTTPS(new_ca.listener_tls())));
+
+		for client in [new_ca.client("http/1.1", true), new_ca.client("h2", true)] {
+			handshake(&client, open_tunnel(&t, IPV4).await, IPV4)
+				.await
+				.expect("reloaded CA should verify");
+		}
+		assert!(
+			handshake(
+				&old_ca.client("http/1.1", true),
+				open_tunnel(&t, IPV4).await,
+				IPV4
+			)
+			.await
+			.is_err(),
+			"certificates from the old CA must no longer be served"
+		);
+	}
+}
+
 #[tokio::test]
 async fn incoming_connect_applies_backend_tls() {
 	let (mock, certs) = tls_mock().await;
