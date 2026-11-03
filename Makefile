@@ -32,6 +32,14 @@ endif
 docker-musl:
 	$(DOCKER_BUILDER) build $(DOCKER_BUILD_ARGS) -t $(IMAGE_FULL_NAME)-musl --build-arg=BUILDER=musl . --progress=plain
 
+# Headless image: no UI assets and no bundled CA trust store. See Dockerfile.headless.
+HEADLESS_PLATFORMS ?= linux/amd64,linux/arm64
+HEADLESS_OUTPUT ?= --push
+
+.PHONY: docker-headless
+docker-headless:
+	$(DOCKER_BUILDER) buildx build $(DOCKER_BUILD_ARGS) -f Dockerfile.headless --platform $(HEADLESS_PLATFORMS) --provenance=false --pull -t $(IMAGE_FULL_NAME) $(HEADLESS_OUTPUT) . --progress=plain
+
 # Build the s390x image from the standalone example Dockerfile.
 # NOTE: s390x is NOT an officially supported build architecture; this builds the
 # unsupported $(DOCKERFILE_S390X) reference and must be run natively on s390x.

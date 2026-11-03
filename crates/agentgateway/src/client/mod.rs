@@ -927,6 +927,37 @@ mod tests {
 	use crate::types::agent::TunnelProtocol;
 
 	#[test]
+	fn dynamic_backend_guard_covers_ip_targets_from_request_hosts() {
+		for host in [
+			"127.0.0.1",
+			"169.254.169.254",
+			"0.0.0.0",
+			"[::1]",
+			"[::]",
+			"[fe80::1]",
+			"[::ffff:127.0.0.1]",
+			"[::ffff:169.254.169.254]",
+		] {
+			let Target::Address(addr) = Target::from((host, 443)) else {
+				panic!("{host} should be an address");
+			};
+			assert!(
+				matches!(
+					check_not_loopback(addr),
+					Err(ProxyError::DynamicBackendLoopback)
+				),
+				"{host} must be denied"
+			);
+		}
+		for host in ["192.0.2.10", "[2001:db8::10]", "[::ffff:192.0.2.10]"] {
+			let Target::Address(addr) = Target::from((host, 443)) else {
+				panic!("{host} should be an address");
+			};
+			assert!(check_not_loopback(addr).is_ok(), "{host} must be allowed");
+		}
+	}
+
+	#[test]
 	fn waypoint_bind_renders_as_waypoint() {
 		assert_eq!(
 			HboneSourceRole::from_tunnel(TunnelProtocol::HboneWaypoint).map(|r| r.as_header_value()),

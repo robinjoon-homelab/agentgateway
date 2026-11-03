@@ -242,6 +242,8 @@ pub struct ServerTLSConfig {
 	inputs: Option<Arc<ServerTlsInputs>>,
 	/// Original strict verifier used when ALLOW_INSECURE_FALLBACK is enabled.
 	insecure_fallback_verifier: Option<Arc<dyn ClientCertVerifier>>,
+	/// Issues and caches leaf certificates for every profile of a dynamic CA listener.
+	dynamic_ca_resolver: Option<Arc<crate::types::dynamic_ca_cert::DynamicCaCertResolver>>,
 	per_profile_config: Arc<RwLock<HashMap<ServerTlsProfileKey, Arc<ServerConfig>>>>,
 }
 
@@ -276,6 +278,7 @@ impl ServerTLSConfig {
 			base_config: Some(config),
 			inputs: None,
 			insecure_fallback_verifier: None,
+			dynamic_ca_resolver: None,
 			per_profile_config: Arc::new(Default::default()),
 		}
 	}
@@ -336,6 +339,7 @@ impl ServerTLSConfig {
 			base_config: Some(Arc::new(base)),
 			inputs: Some(inputs),
 			insecure_fallback_verifier,
+			dynamic_ca_resolver: None,
 			per_profile_config: Arc::new(Default::default()),
 		})
 	}
@@ -363,22 +367,31 @@ impl ServerTLSConfig {
 		});
 		let suites = cipher_suites.as_deref().filter(|s| !s.is_empty());
 		let groups = key_exchange_groups.as_deref().filter(|g| !g.is_empty());
-		let base = crate::types::dynamic_ca_cert::build_dynamic_ca_server_config(
+		// Report an unusable TLS profile ahead of any problem with the CA.
+		crate::transport::tls::provider_with_options_validated(
+			suites.unwrap_or(&[]),
+			groups.unwrap_or(&[]),
+		)?;
+		let resolver = crate::types::dynamic_ca_cert::DynamicCaCertResolver::new(
 			&inputs.cert_pem,
 			&inputs.key_pem,
+			&inputs.dynamic_ca_cert_cache,
+		)?;
+		let base = crate::types::dynamic_ca_cert::build_dynamic_ca_server_config(
+			Arc::clone(&resolver),
 			None,
 			&inputs.default_alpns,
 			min_version,
 			max_version,
 			suites.unwrap_or(&[]),
 			groups.unwrap_or(&[]),
-			&inputs.dynamic_ca_cert_cache,
 		)?;
 		Ok(Self {
 			source: ServerTlsCertificateSource::DynamicCa,
 			base_config: Some(Arc::new(base)),
 			inputs: Some(inputs),
 			insecure_fallback_verifier: None,
+			dynamic_ca_resolver: Some(resolver),
 			per_profile_config: Arc::new(Default::default()),
 		})
 	}
@@ -390,6 +403,7 @@ impl ServerTLSConfig {
 			base_config: None,
 			inputs: None,
 			insecure_fallback_verifier: None,
+			dynamic_ca_resolver: None,
 			per_profile_config: Arc::new(Default::default()),
 		}
 	}
@@ -403,6 +417,7 @@ impl ServerTLSConfig {
 			base_config: None,
 			inputs: None,
 			insecure_fallback_verifier: None,
+			dynamic_ca_resolver: None,
 			per_profile_config: Arc::new(Default::default()),
 		}
 	}
@@ -414,6 +429,7 @@ impl ServerTLSConfig {
 			base_config: None,
 			inputs: None,
 			insecure_fallback_verifier: None,
+			dynamic_ca_resolver: None,
 			per_profile_config: Arc::new(Default::default()),
 		}
 	}
@@ -499,16 +515,18 @@ impl ServerTLSConfig {
 				base
 			},
 			ServerTlsCertificateSource::DynamicCa => {
+				let resolver = self
+					.dynamic_ca_resolver
+					.clone()
+					.ok_or_else(|| anyhow!("dynamic CA resolver is required for dynamic CA TLS"))?;
 				crate::types::dynamic_ca_cert::build_dynamic_ca_server_config(
-					&inputs.cert_pem,
-					&inputs.key_pem,
+					resolver,
 					Some(&key.alpns),
 					&inputs.default_alpns,
 					key.min_version,
 					key.max_version,
 					&key.cipher_suites,
 					&key.key_exchange_groups,
-					&inputs.dynamic_ca_cert_cache,
 				)?
 			},
 			ServerTlsCertificateSource::IstioWorkload { .. }
@@ -517,6 +535,22 @@ impl ServerTLSConfig {
 		let base = Arc::new(base);
 		writer.insert(key.clone(), Arc::clone(&base));
 		Ok(base)
+	}
+
+	/// Adapts `config` for a connection that sent no SNI inside a CONNECT tunnel to
+	/// `authority`. Only dynamic CA listeners change: other certificate sources do not
+	/// depend on the requested name.
+	fn config_for_connect_authority(
+		&self,
+		config: Arc<ServerConfig>,
+		authority: &::http::uri::Authority,
+	) -> Arc<ServerConfig> {
+		match self.dynamic_ca_resolver.as_ref() {
+			Some(resolver) => crate::types::dynamic_ca_cert::server_config_for_connect_authority(
+				config, resolver, authority,
+			),
+			None => config,
+		}
 	}
 
 	pub fn allow_insecure_mtls(&self) -> bool {
@@ -749,6 +783,20 @@ impl ListenerProtocol {
 				None => None,
 			},
 			_ => None,
+		}
+	}
+
+	/// See [`ServerTLSConfig::config_for_connect_authority`].
+	pub(crate) fn config_for_connect_authority(
+		&self,
+		config: Arc<rustls::ServerConfig>,
+		authority: &::http::uri::Authority,
+	) -> Arc<rustls::ServerConfig> {
+		match self {
+			ListenerProtocol::HTTPS(t) | ListenerProtocol::TLS(Some(t)) => {
+				t.config_for_connect_authority(config, authority)
+			},
+			_ => config,
 		}
 	}
 
@@ -3353,9 +3401,14 @@ impl serde::Serialize for Target {
 
 impl From<(&str, u16)> for Target {
 	fn from((host, port): (&str, u16)) -> Self {
-		match host.parse::<IpAddr>() {
-			Ok(target) => Target::Address(SocketAddr::new(target, port)),
-			Err(_) => Target::Hostname(host.into(), port),
+		// The host of a URI or authority keeps the brackets around an IPv6 address.
+		let ip = match host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+			Some(ipv6) => ipv6.parse::<std::net::Ipv6Addr>().ok().map(IpAddr::V6),
+			None => host.parse::<IpAddr>().ok(),
+		};
+		match ip {
+			Some(ip) => Target::Address(SocketAddr::new(ip, port)),
+			None => Target::Hostname(host.into(), port),
 		}
 	}
 }
@@ -3584,6 +3637,59 @@ mod tests {
 		assert_eq!(profiled.alpn_protocols, vec![b"http/1.1".to_vec()]);
 	}
 
+	#[tokio::test]
+	async fn connect_authority_config_applies_only_to_dynamic_ca() {
+		let ca_key = rcgen::KeyPair::generate().expect("generate CA key");
+		let mut ca_params = rcgen::CertificateParams::default();
+		ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+		let ca_cert = ca_params.self_signed(&ca_key).expect("generate CA cert");
+		let authority: ::http::uri::Authority = "192.0.2.10:443".parse().expect("authority");
+
+		let dynamic = ServerTLSConfig::dynamic_ca_with_profile(
+			ca_cert.pem().into_bytes(),
+			ca_key.serialize_pem().into_bytes(),
+			vec![b"h2".to_vec()],
+			None,
+			None,
+			None,
+			None,
+			Default::default(),
+		)
+		.expect("build dynamic CA TLS config");
+		let frontend_tls = frontend::TLS {
+			alpn: Some(vec![b"http/1.1".to_vec()]),
+			..Default::default()
+		};
+		let profiled = dynamic
+			.config_for(Some(&frontend_tls), None, None)
+			.await
+			.expect("profiled config");
+		let derived = dynamic.config_for_connect_authority(profiled.clone(), &authority);
+		assert!(!Arc::ptr_eq(&profiled, &derived));
+		assert_eq!(derived.alpn_protocols, vec![b"http/1.1".to_vec()]);
+		assert!(!derived.session_storage.can_cache());
+		assert_eq!(derived.send_tls13_tickets, 0);
+		// The shared config is left as it was, keeping resumption for SNI connections.
+		assert!(profiled.session_storage.can_cache());
+		assert_ne!(profiled.send_tls13_tickets, 0);
+
+		let static_config = ServerTLSConfig::from_pem(
+			include_bytes!("../../../../examples/mcp-tls/certs/cert.pem").to_vec(),
+			include_bytes!("../../../../examples/mcp-tls/certs/key.pem").to_vec(),
+			None,
+			vec![],
+		)
+		.expect("build static TLS config");
+		let base = static_config
+			.config_for(None, None, None)
+			.await
+			.expect("static config");
+		assert!(Arc::ptr_eq(
+			&base,
+			&static_config.config_for_connect_authority(base.clone(), &authority),
+		));
+	}
+
 	#[cfg(feature = "fips")]
 	#[test]
 	fn fips_config_static_frontend_tls_rejects_non_approved_cipher_suite() {
@@ -3790,6 +3896,28 @@ InvalidKeyData
 		let json = serde_json::to_value(&target).unwrap();
 		let target: Target = serde_json::from_value(json).unwrap();
 		assert_eq!(target.to_string(), "[::1]:8080");
+	}
+
+	#[test]
+	fn test_target_from_host_and_port() {
+		for (host, expected) in [
+			("[::1]", "[::1]:8080"),
+			("[2001:DB8::1]", "[2001:db8::1]:8080"),
+			("[::ffff:127.0.0.1]", "[::ffff:127.0.0.1]:8080"),
+			("::1", "[::1]:8080"),
+			("127.0.0.1", "127.0.0.1:8080"),
+		] {
+			assert!(
+				matches!(Target::from((host, 8080)), Target::Address(addr) if addr.to_string() == expected),
+				"{host} should be the address {expected}"
+			);
+		}
+		for host in ["example.com", "[127.0.0.1]", "[example.com]", "[::1"] {
+			assert!(
+				matches!(Target::from((host, 8080)), Target::Hostname(h, 8080) if h.as_str() == host),
+				"{host} should stay a hostname"
+			);
+		}
 	}
 
 	#[test]

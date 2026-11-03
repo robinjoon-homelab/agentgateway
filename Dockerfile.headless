@@ -1,0 +1,99 @@
+# syntax=docker/dockerfile:1.11@sha256:10c699f1b6c8bdc8f6b4ce8974855dd8542f1768c26eb240237b8f1c9c6c9976
+#
+# Headless production image: no UI assets, every base image pinned by its multi-arch
+# digest, Rust dependencies locked, and no CA trust store in the image. Upstream trust
+# must be supplied at runtime through backendTLS.root.
+#
+#   docker buildx build -f Dockerfile.headless \
+#     --platform linux/amd64,linux/arm64 --provenance=false --pull \
+#     --build-arg VERSION=1.7.0-homelab-<short-revision> \
+#     --build-arg GIT_REVISION=<revision of the Rust source> \
+#     -t <registry>/agentgateway:<tag> --push .
+#
+# PROFILE defaults to quick-release, an optimized release-derived profile without LTO.
+# PROFILE=release also works but needs far more memory and time.
+#
+# To package binaries from tools/build_headless_binary.sh without compiling again:
+#
+#     --build-arg BINARY_SOURCE=prebuilt --build-context prebuilt=<dir>
+#
+# where <dir> holds <arch>/agentgateway, for example amd64/agentgateway.
+ARG BINARY_SOURCE=compiled
+
+# The compiler runs on the build platform and cross-compiles when the target differs,
+# because a fat-LTO build under QEMU is impractically slow.
+FROM --platform=$BUILDPLATFORM docker.io/library/rust:1.99.0-trixie@sha256:81015672d6939b0265f09adf96d5de125482bb1330106076956b0518e74edc90 AS compiled-binary
+ARG BUILDARCH
+ARG TARGETARCH
+ARG VERSION
+ARG GIT_REVISION
+ARG PROFILE=quick-release
+# One job at a time limits peak memory; rustc has been killed for memory on smaller hosts.
+ARG CARGO_BUILD_JOBS=1
+# Only used to install the cross toolchain, so its versions are fixed too.
+ARG DEBIAN_SNAPSHOT=20261101T000000Z
+WORKDIR /app
+COPY Cargo.toml Cargo.lock ./
+COPY .cargo ./.cargo
+COPY crates ./crates
+COPY tools ./tools
+COPY catalog ./catalog
+RUN <<EOT
+set -eu
+if [ "$BUILDARCH" != "$TARGETARCH" ]; then
+  case "$TARGETARCH" in
+    amd64) packages="gcc-x86-64-linux-gnu g++-x86-64-linux-gnu" ;;
+    arm64) packages="gcc-aarch64-linux-gnu g++-aarch64-linux-gnu" ;;
+    *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;;
+  esac
+  rm -f /etc/apt/sources.list.d/*
+  echo "deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/$DEBIAN_SNAPSHOT trixie main" > /etc/apt/sources.list
+  apt-get update
+  apt-get install -y --no-install-recommends $packages
+fi
+EOT
+RUN \
+    --mount=type=cache,id=agentgateway-headless-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=agentgateway-headless-cargo-git,target=/usr/local/cargo/git \
+    --mount=type=cache,id=agentgateway-headless-target,target=/app/target \
+    VERSION="$VERSION" GIT_REVISION="$GIT_REVISION" PROFILE="$PROFILE" CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS" \
+    tools/build_headless_binary.sh "$TARGETARCH" /out/agentgateway
+
+FROM scratch AS prebuilt-binary
+ARG TARGETARCH
+COPY --from=prebuilt $TARGETARCH/agentgateway /out/agentgateway
+
+FROM ${BINARY_SOURCE}-binary AS binary
+
+# Both binary sources must carry the metadata the image labels claim. The binary may be
+# for another architecture, so search it instead of running it.
+FROM --platform=$BUILDPLATFORM docker.io/library/debian:trixie-slim@sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4 AS verified-binary
+ARG VERSION
+ARG GIT_REVISION
+COPY --from=binary /out/agentgateway /out/agentgateway
+RUN test -n "$VERSION" && test -n "$GIT_REVISION" \
+    && grep -qaF "$VERSION" /out/agentgateway \
+    && grep -qaF "$GIT_REVISION" /out/agentgateway
+
+FROM cgr.dev/chainguard/glibc-dynamic@sha256:709673274b417a48f56374da8a7633ef7b2f5b27e34612ce98a335737318cc94 AS runtime-base
+
+# The base image ships a default CA bundle. Rebuild its filesystem without any of the
+# trust store paths so that nothing can fall back to it, in any layer.
+FROM --platform=$BUILDPLATFORM docker.io/library/debian:trixie-slim@sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4 AS runtime-rootfs
+COPY --from=runtime-base / /rootfs/
+RUN rm -rf /rootfs/etc/ssl /rootfs/etc/pki
+
+FROM scratch AS runner
+ARG VERSION
+ARG GIT_REVISION
+COPY --from=runtime-rootfs /rootfs/ /
+COPY --from=verified-binary --chmod=0555 /out/agentgateway /app/agentgateway
+ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/sbin:/sbin:/bin
+ENV AGENTGATEWAY_ENV=container
+LABEL org.opencontainers.image.source="https://github.com/robinjoon-homelab/agentgateway"
+LABEL org.opencontainers.image.revision="$GIT_REVISION"
+LABEL org.opencontainers.image.version="$VERSION"
+LABEL org.opencontainers.image.description="Headless agentgateway without a bundled CA trust store."
+USER 65532:65532
+ENTRYPOINT ["/app/agentgateway"]
+CMD ["-f", "/etc/agentgateway/config.yaml"]

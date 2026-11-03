@@ -1276,6 +1276,14 @@ impl Gateway {
 					Err(e)
 				},
 				Some(Ok(cfg)) => {
+					// Clients send no SNI for IP-address URLs. Inside an explicit CONNECT tunnel, the
+					// tunnel's authority still names the destination, so a dynamic CA can issue for it.
+					let cfg = match ext.get::<ConnectAuthority>() {
+						Some(authority) if sni.is_empty() => best
+							.protocol
+							.config_for_connect_authority(cfg, &authority.0),
+						_ => cfg,
+					};
 					let tokio_rustls::StartHandshake { accepted, io, .. } = start;
 					let start = tokio_rustls::StartHandshake::from_parts(accepted, Box::new(io.discard()));
 					let tls = start.into_stream(cfg).await?;
