@@ -28,6 +28,8 @@ ARG TARGETARCH
 ARG VERSION
 ARG GIT_REVISION
 ARG PROFILE=quick-release
+# One job at a time limits peak memory; rustc has been killed for memory on smaller hosts.
+ARG CARGO_BUILD_JOBS=1
 # Only used to install the cross toolchain, so its versions are fixed too.
 ARG DEBIAN_SNAPSHOT=20261101T000000Z
 WORKDIR /app
@@ -53,8 +55,8 @@ EOT
 RUN \
     --mount=type=cache,id=agentgateway-headless-cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=agentgateway-headless-cargo-git,target=/usr/local/cargo/git \
-    --mount=type=cache,id=agentgateway-headless-target-$TARGETARCH,target=/app/target \
-    VERSION="$VERSION" GIT_REVISION="$GIT_REVISION" PROFILE="$PROFILE" \
+    --mount=type=cache,id=agentgateway-headless-target,target=/app/target \
+    VERSION="$VERSION" GIT_REVISION="$GIT_REVISION" PROFILE="$PROFILE" CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS" \
     tools/build_headless_binary.sh "$TARGETARCH" /out/agentgateway
 
 FROM scratch AS prebuilt-binary
